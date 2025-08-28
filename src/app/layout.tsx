@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Nunito } from "next/font/google";
 import "./globals.css";
 
@@ -17,7 +17,6 @@ export const metadata: Metadata = {
   applicationName: 'Vidchat WebRTC',
   robots: { index: true, follow: true },
   icons: { icon: '/favicon.ico' },
-  themeColor: '#f4f4f5',
   openGraph: {
     type: 'website',
     title: 'Vidchat WebRTC',
@@ -31,6 +30,10 @@ export const metadata: Metadata = {
     title: 'Vidchat WebRTC',
     description: 'Simple video chat using WebRTC with Firestore for signaling.',
   },
+};
+
+export const viewport: Viewport = {
+  themeColor: '#f4f4f5',
 };
 
 export default function RootLayout({

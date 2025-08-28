@@ -14,6 +14,7 @@ import {
   type DocumentReference,
   type QuerySnapshot,
   type DocumentSnapshot,
+  type FirestoreError,
 } from 'firebase/firestore'
 import { db } from './firebase'
 import { serverTimestamp } from 'firebase/firestore'
@@ -65,19 +66,19 @@ export const addAnswerIceCandidate = (
 export const listenCallDoc = (
   callDoc: DocumentReference<DocumentData>,
   onNext: (snapshot: DocumentSnapshot<DocumentData>) => void,
-  onError?: (error: any) => void
+  onError?: (error: FirestoreError) => void
 ) => onSnapshot(callDoc, onNext, onError)
 
 export const listenOfferCandidates = (
   offerCandidates: CollectionReference<DocumentData>,
   onNext: (snapshot: QuerySnapshot<DocumentData>) => void,
-  onError?: (error: any) => void
+  onError?: (error: FirestoreError) => void
 ) => onSnapshot(offerCandidates, onNext, onError)
 
 export const listenAnswerCandidates = (
   answerCandidates: CollectionReference<DocumentData>,
   onNext: (snapshot: QuerySnapshot<DocumentData>) => void,
-  onError?: (error: any) => void
+  onError?: (error: FirestoreError) => void
 ) => onSnapshot(answerCandidates, onNext, onError)
 
 // Read a call doc once

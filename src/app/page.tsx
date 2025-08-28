@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { Suspense, useEffect, useRef, useState } from "react"
 import {
   addAnswerIceCandidate,
   addOfferIceCandidate,
@@ -20,7 +20,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 
 type Streams = MediaStream | null
 
-export default function Home() {
+function PageInner() {
   // UI state
   const [callId, setCallId] = useState<string>("")
   const [status, setStatus] = useState<string>('idle') // idle | initialized | connecting | connected | disconnected | failed
@@ -124,7 +124,7 @@ export default function Home() {
       console.error('initializeCamera error', err)
       let msg = 'Failed to access camera/mic'
       try {
-        const e = err as any
+        const e = err as { name?: string; code?: string }
         const name = (e && (e.name || e.code)) || ''
         if (name === 'NotAllowedError' || name === 'SecurityError') {
           msg = 'Allow mic/camera in the browser to join'
@@ -350,25 +350,10 @@ export default function Home() {
     }
   }
 
-  // Current persisted context (URL takes precedence over localStorage)
-  const persisted = useMemo(() => {
-    const fromUrlId = search.get('id') || ''
-    const fromUrlRole = search.get('role') || ''
-    if (fromUrlId) return { callId: fromUrlId, role: fromUrlRole }
-    try {
-      const raw = localStorage.getItem('vcw.session')
-      if (raw) {
-        const s = JSON.parse(raw) as { callId?: string; role?: string }
-        return { callId: s.callId || '', role: s.role || '' }
-      }
-    } catch {}
-    return { callId: '', role: '' }
-  }, [search])
-
   const isReady = !!localStreamRef.current && !!pcRef.current
 
-  // Auto-join when a user opens a join link like /?id=<callId>
-  // Will not trigger if role=caller (so callers don't re-join as answerers).
+  // Auto-join/re-offer when a user opens a join link like /?id=<callId>
+  // If role=caller, re-negotiate a fresh offer into the same callId after reload.
   const autoJoinTriedRef = useRef(false)
   useEffect(() => {
     if (autoJoinTriedRef.current) return
@@ -377,31 +362,50 @@ export default function Home() {
     const id = search.get('id') || ''
     const role = (search.get('role') || '').toLowerCase()
     if (!id) return
-    if (role === 'caller') return
-
-    // Prefill and auto-join
-    if (inputRef.current) inputRef.current.value = id
     autoJoinTriedRef.current = true
-    ;(async () => {
-      try {
-        setJoining(true)
-        await answerCall()
-      } finally {
-        setJoining(false)
-      }
-    })()
+
+    if (role === 'caller') {
+      // Re-offer path for caller
+      ;(async () => {
+        try {
+          const pc = pcRef.current
+          if (!pc) return
+          const { callDoc, offerCandidates, answerCandidates } = getCallRefs(id)
+          setCallId(id)
+          setInSession(true)
+          pc.onicecandidate = (e) => { if (e.candidate) addOfferIceCandidate(offerCandidates, e.candidate.toJSON()) }
+          setStatus('connecting')
+          const offerDescription = await pc.createOffer(); await pc.setLocalDescription(offerDescription)
+          await writeOffer(callDoc, { sdp: offerDescription.sdp, type: offerDescription.type })
+          callDocUnsubRef.current = listenCallDoc(callDoc, (snapshot) => {
+            const data = snapshot.data()
+            if (!pc.currentRemoteDescription && data?.answer) {
+              const anserDescription = new RTCSessionDescription(data.answer)
+              pc.setRemoteDescription(anserDescription)
+            }
+          })
+          answerCandUnsubRef.current = listenAnswerCandidates(answerCandidates, (snapshot) => {
+            snapshot.docChanges().forEach((change) => { if (change.type === 'added') { const c = new RTCIceCandidate(change.doc.data()); pc.addIceCandidate(c) } })
+          })
+          try { localStorage.setItem('vcw.session', JSON.stringify({ role: 'caller', callId: id })) } catch {}
+        } catch (e) {
+          console.error('auto re-offer failed', e)
+        }
+      })()
+    } else {
+      // Prefill and auto-join as answerer
+      if (inputRef.current) inputRef.current.value = id
+      ;(async () => {
+        try {
+          setJoining(true)
+          await answerCall()
+        } finally {
+          setJoining(false)
+        }
+      })()
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, search])
-
-  // status badge styles
-  const statusBadge: Record<string, string> = {
-    idle: 'bg-zinc-200 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200',
-    initialized: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-200',
-    connecting: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-200',
-    connected: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200',
-    disconnected: 'bg-zinc-200 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200',
-    failed: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200',
-  }
 
   return (
     <div className="min-h-dvh flex flex-col">
@@ -530,5 +534,13 @@ export default function Home() {
 
       </div>
     </div>
+  )
+}
+
+export default function Home() {
+  return (
+    <Suspense fallback={<div className="max-w-5xl mx-auto px-4 py-5 text-sm text-zinc-600">Loading…</div>}>
+      <PageInner />
+    </Suspense>
   )
 }
