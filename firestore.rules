@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper validators
+    function hasOnly(map, keys) {
+      return map.keys().hasOnly(keys);
+    }
+
+    function isSdp(desc, expected) {
+      return desc is map
+        && desc.type is string
+        && desc.type == expected
+        && desc.sdp is string;
+    }
+
+    // Public signaling with tight field-level constraints
+    match /calls/{callId} {
+      // Anyone with the link can read minimal signaling data
+      allow get, list: if true;
+
+      // Create a call with an 'offer' only (and optional createdAt set by client/server)
+      allow create: if
+        hasOnly(request.resource.data, ['offer', 'createdAt']) &&
+        isSdp(request.resource.data.offer, 'offer');
+
+      // Allow only adding 'answer'; 'offer' must remain unchanged
+      allow update: if
+        request.resource.data.diff(resource.data).changedKeys().hasOnly(['answer']) &&
+        request.resource.data.offer == resource.data.offer &&
+        isSdp(request.resource.data.answer, 'answer');
+
+      // Disallow deletes from untrusted clients
+      allow delete: if false;
+
+      // ICE candidates: allow append-only creates with limited fields
+      match /offerCandidates/{docId} {
+        allow get, list: if true;
+        allow create: if hasOnly(request.resource.data, ['candidate','sdpMLineIndex','sdpMid','usernameFragment']);
+        allow update, delete: if false;
+      }
+      match /answerCandidates/{docId} {
+        allow get, list: if true;
+        allow create: if hasOnly(request.resource.data, ['candidate','sdpMLineIndex','sdpMid','usernameFragment']);
+        allow update, delete: if false;
+      }
+    }
+  }
+}
+

@@ -1,8 +1,11 @@
 import {
   addDoc,
   collection,
+  deleteDoc,
   doc,
   getDoc,
+  getDocs,
+  writeBatch,
   onSnapshot,
   setDoc,
   updateDoc,
@@ -13,6 +16,7 @@ import {
   type DocumentSnapshot,
 } from 'firebase/firestore'
 import { db } from './firebase'
+import { serverTimestamp } from 'firebase/firestore'
 
 export type CallRefs = {
   callDoc: DocumentReference<DocumentData>
@@ -38,7 +42,8 @@ export const getCallRefs = (id: string): CallRefs => {
 
 // Write offer/answer payloads
 export const writeOffer = (callDoc: DocumentReference<DocumentData>, offer: RTCSessionDescriptionInit) => {
-  return setDoc(callDoc, { offer })
+  // include timestamps to support TTL/cleanup
+  return setDoc(callDoc, { offer, createdAt: serverTimestamp() })
 }
 
 export const writeAnswer = (callDoc: DocumentReference<DocumentData>, answer: RTCSessionDescriptionInit) => {
@@ -78,4 +83,29 @@ export const listenAnswerCandidates = (
 // Read a call doc once
 export const getCallData = async (callDoc: DocumentReference<DocumentData>) => {
   return (await getDoc(callDoc)).data()
+}
+
+// Best-effort cleanup: delete all docs in a subcollection
+export const deleteAllDocsInCollection = async (coll: CollectionReference<DocumentData>) => {
+  const snap = await getDocs(coll)
+  if (snap.empty) return
+
+  // Firestore limits batches to 500 operations. Chunk if needed.
+  const docs = snap.docs
+  const chunkSize = 450
+  for (let i = 0; i < docs.length; i += chunkSize) {
+    const batch = writeBatch(db)
+    for (const d of docs.slice(i, i + chunkSize)) {
+      batch.delete(d.ref)
+    }
+    await batch.commit()
+  }
+}
+
+// Delete the call doc and its subcollections (offer/answer candidates)
+export const deleteCallData = async (id: string) => {
+  const { callDoc, offerCandidates, answerCandidates } = getCallRefs(id)
+  try { await deleteAllDocsInCollection(offerCandidates) } catch {}
+  try { await deleteAllDocsInCollection(answerCandidates) } catch {}
+  try { await deleteDoc(callDoc) } catch {}
 }

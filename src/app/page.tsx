@@ -1,10 +1,11 @@
 'use client'
 
-import { useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   addAnswerIceCandidate,
   addOfferIceCandidate,
   createCallRefs,
+  deleteCallData,
   getCallData,
   getCallRefs,
   listenAnswerCandidates,
@@ -14,6 +15,8 @@ import {
   writeOffer,
 } from "@/lib/dal"
 import { Toaster, toast } from 'sonner'
+import { Plus, LogIn, Link as LinkIcon, Hash, Power } from 'lucide-react'
+import { useRouter, useSearchParams } from 'next/navigation'
 
 type Streams = MediaStream | null
 
@@ -21,6 +24,11 @@ export default function Home() {
   // UI state
   const [callId, setCallId] = useState<string>("")
   const [status, setStatus] = useState<string>('idle') // idle | initialized | connecting | connected | disconnected | failed
+  const [mediaError, setMediaError] = useState<string | null>(null)
+  const [joining, setJoining] = useState<boolean>(false)
+  const [inSession, setInSession] = useState<boolean>(false)
+  const router = useRouter()
+  const search = useSearchParams()
 
   // DOM refs
   const inputRef = useRef<HTMLInputElement>(null)
@@ -37,7 +45,7 @@ export default function Home() {
   const offerCandUnsubRef = useRef<null | (() => void)>(null)
   const answerCandUnsubRef = useRef<null | (() => void)>(null)
 
-  // STUN servers for ICE. In production, add a TURN server for reliability.
+  // STUN/TURN servers for ICE. In production, include a TURN server for reliability.
   const servers: RTCConfiguration = {
     iceServers: [
       {
@@ -46,6 +54,14 @@ export default function Home() {
           'stun:stun2.l.google.com:19302',
         ],
       },
+      // Optional TURN via env (NEXT_PUBLIC_TURN_URLS comma-separated)
+      ...(process.env.NEXT_PUBLIC_TURN_URLS
+        ? [{
+            urls: process.env.NEXT_PUBLIC_TURN_URLS.split(',').map(s => s.trim()),
+            username: process.env.NEXT_PUBLIC_TURN_USERNAME,
+            credential: process.env.NEXT_PUBLIC_TURN_CREDENTIAL,
+          } as RTCIceServer]
+        : []),
     ],
     iceCandidatePoolSize: 10,
   }
@@ -70,6 +86,10 @@ export default function Home() {
         } else if (st === 'disconnected' || st === 'closed') {
           setStatus('disconnected')
         }
+      }
+      // Log ICE changes to aid debugging in production
+      pc.oniceconnectionstatechange = () => {
+        // console.debug('iceConnectionState', pc.iceConnectionState)
       }
 
       // Get local stream and show preview
@@ -98,12 +118,43 @@ export default function Home() {
         remoteVideoRef.current.srcObject = remote
       }
       setStatus('initialized')
+      setMediaError(null)
       toast.success('Camera initialized')
     } catch (err) {
       console.error('initializeCamera error', err)
-      toast.error('Failed to access camera/mic')
+      let msg = 'Failed to access camera/mic'
+      try {
+        const e = err as any
+        const name = (e && (e.name || e.code)) || ''
+        if (name === 'NotAllowedError' || name === 'SecurityError') {
+          msg = 'Allow mic/camera in the browser to join'
+        }
+      } catch {}
+      setMediaError(msg)
+      toast.error(msg)
     }
   }
+
+  // Auto-initialize camera on mount
+  useEffect(() => {
+    initializeCamera()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Redirect to meeting if session exists and URL lacks searchParams
+  useEffect(() => {
+    const id = search.get('id') || ''
+    if (id) return
+    try {
+      const raw = localStorage.getItem('vcw.session')
+      if (!raw) return
+      const s = JSON.parse(raw) as { callId?: string; role?: string }
+      if (s?.callId) {
+        router.replace(`/?id=${encodeURIComponent(s.callId)}${s.role ? `&role=${encodeURIComponent(s.role)}` : ''}`)
+      }
+    } catch {}
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Start a new call and publish the offer + ICE candidates
   const startCall = async () => {
@@ -120,6 +171,7 @@ export default function Home() {
 
       // Expose the call id for sharing
       setCallId(callDoc.id)
+      setInSession(true)
 
       // Gather local ICE and write to offerCandidates
       pc.onicecandidate = (e) => {
@@ -135,6 +187,13 @@ export default function Home() {
       const offer = { sdp: offerDescription.sdp, type: offerDescription.type }
       await writeOffer(callDoc, offer)
       toast.success('Call created')
+
+      // Persist session and update URL for share/join links (root path)
+      try {
+        localStorage.setItem('vcw.session', JSON.stringify({ role: 'caller', callId: callDoc.id }))
+      } catch {}
+      const url = `/?id=${encodeURIComponent(callDoc.id)}&role=caller`
+      router.replace(url)
 
       // Listen for an answer and set as remote description
       callDocUnsubRef.current = listenCallDoc(callDoc, (snapshot) => {
@@ -172,6 +231,7 @@ export default function Home() {
       if (!pc || !remoteCallId) return
 
       const { callDoc, answerCandidates, offerCandidates } = getCallRefs(remoteCallId)
+      setInSession(true)
 
       // Gather local ICE and write to answerCandidates
       pc.onicecandidate = (e) => {
@@ -197,6 +257,12 @@ export default function Home() {
       await writeAnswer(callDoc, answer)
       toast.success('Joined call')
 
+      try {
+        localStorage.setItem('vcw.session', JSON.stringify({ role: 'answerer', callId: remoteCallId }))
+      } catch {}
+      const url = `/?id=${encodeURIComponent(remoteCallId)}&role=answerer`
+      router.replace(url)
+
       // Listen for caller ICE candidates
       offerCandUnsubRef.current = listenOfferCandidates(offerCandidates, (snapshot) => {
         snapshot.docChanges().forEach((change) => {
@@ -215,8 +281,14 @@ export default function Home() {
   }
 
   // Stop media, close PC, unsubscribe Firestore listeners, and clear UI
-  const disconnect = () => {
+  const disconnect = async () => {
     try {
+      // Snapshot session before clearing
+      let sess: { role?: string; callId?: string } | null = null
+      try {
+        const raw = localStorage.getItem('vcw.session')
+        if (raw) sess = JSON.parse(raw)
+      } catch {}
       // Unsubscribe Firestore listeners if any
       callDocUnsubRef.current?.()
       offerCandUnsubRef.current?.()
@@ -242,18 +314,84 @@ export default function Home() {
       // Detach from video elements
       if (localVideoRef.current) localVideoRef.current.srcObject = null
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
+      // Best-effort: delete call data if you are the caller (ask first)
+      const idToClear = callId || sess?.callId || ''
+      const role = sess?.role || ''
+      if (idToClear && role === 'caller') {
+        let shouldDelete = false
+        try {
+          // Simple confirmation. If declined, we only leave locally.
+          shouldDelete = typeof window !== 'undefined'
+            ? window.confirm('End meeting for everyone and delete the meeting link?')
+            : false
+        } catch {}
+        if (shouldDelete) {
+          try {
+            await deleteCallData(idToClear)
+            toast.success('Meeting data deleted')
+          } catch (e) {
+            console.error('deleteCallData error', e)
+          }
+        }
+      }
 
-      // Keep the call id visible (can be useful), but you could clear it
-      // setCallId("")
+      // Clear persisted session (user left)
+      try { localStorage.removeItem('vcw.session') } catch {}
       setStatus('disconnected')
+      setInSession(false)
       toast('Disconnected')
+      // Clear UI state and URL
+      setCallId("")
+      if (inputRef.current) inputRef.current.value = ""
+      router.replace('/')
     } catch (err) {
       console.error('disconnect error', err)
       toast.error('Failed to disconnect')
     }
   }
 
+  // Current persisted context (URL takes precedence over localStorage)
+  const persisted = useMemo(() => {
+    const fromUrlId = search.get('id') || ''
+    const fromUrlRole = search.get('role') || ''
+    if (fromUrlId) return { callId: fromUrlId, role: fromUrlRole }
+    try {
+      const raw = localStorage.getItem('vcw.session')
+      if (raw) {
+        const s = JSON.parse(raw) as { callId?: string; role?: string }
+        return { callId: s.callId || '', role: s.role || '' }
+      }
+    } catch {}
+    return { callId: '', role: '' }
+  }, [search])
+
   const isReady = !!localStreamRef.current && !!pcRef.current
+
+  // Auto-join when a user opens a join link like /?id=<callId>
+  // Will not trigger if role=caller (so callers don't re-join as answerers).
+  const autoJoinTriedRef = useRef(false)
+  useEffect(() => {
+    if (autoJoinTriedRef.current) return
+    if (!isReady) return
+
+    const id = search.get('id') || ''
+    const role = (search.get('role') || '').toLowerCase()
+    if (!id) return
+    if (role === 'caller') return
+
+    // Prefill and auto-join
+    if (inputRef.current) inputRef.current.value = id
+    autoJoinTriedRef.current = true
+    ;(async () => {
+      try {
+        setJoining(true)
+        await answerCall()
+      } finally {
+        setJoining(false)
+      }
+    })()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, search])
 
   // status badge styles
   const statusBadge: Record<string, string> = {
@@ -266,99 +404,131 @@ export default function Home() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto p-5">
-      <Toaster position="top-center" richColors closeButton />
+    <div className="min-h-dvh flex flex-col">
+      <Toaster position="top-right"/>
+      {/* Top Bar */}
+      <header className="sticky top-0 z-30 border-b border-zinc-300/60 bg-zinc-100/80 backdrop-blur">
+        <div className="max-w-5xl mx-auto px-4 py-3 flex flex-wrap-reverse items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            {!inSession && (
+              <>
+                <button
+                  className="text-sm h-10 px-3 rounded border bg-emerald-200 text-emerald-950 cursor-pointer border-emerald-300 hover:bg-emerald-300 disabled:opacity-50 inline-flex items-center"
+                  onClick={async () => {
+                    if (!isReady) await initializeCamera()
+                    await startCall()
+                  }}
+                  disabled={!isReady}
+                >
+                  <span className="inline-flex items-center gap-1.5" title="New meeting">
+                    <Plus size={16} className="inline-block"/>
+                    New
+                  </span>
+                </button>
+                <input
+                  ref={inputRef}
+                  type="text"
+                  placeholder="Call ID"
+                  defaultValue={(search.get('id') || '')}
+                  className="text-sm h-10 px-2 rounded border border-zinc-300 bg-white w-44 placeholder:text-zinc-500 outline-none focus:ring-2 ring-sky-400"
+                />
+                <button
+                  className="text-sm h-10 px-3 rounded border bg-sky-200 text-sky-950 border-sky-300 hover:bg-sky-300 disabled:opacity-50 inline-flex items-center cursor-pointer"
+                  onClick={answerCall}
+                  // disabled={!isReady}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <LogIn size={16} className="inline-block"/>
+                    Join
+                  </span>
+                </button>
+              </>
+            )}
+            {inSession && (
+              <>
+                {!!callId && (
+                  <>
+                    <button
+                      className="text-xs h-10 px-2 rounded border border-zinc-300 bg-zinc-200 cursor-pointer hover:bg-zinc-300 inline-flex items-center"
+                      title="Copy call id"
+                      onClick={async () => {
+                        try { await navigator.clipboard.writeText(callId); toast.success('Copied call id') } catch { toast.error('Copy failed') }
+                      }}
+                    >
+                      <span className="inline-flex items-center gap-1.5">
+                        <Hash size={14} className="inline-block"/>
+                        ID
+                      </span>
+                    </button>
+                    <button
+                      className="text-xs h-10 px-2 rounded border border-zinc-300 bg-zinc-200 cursor-pointer hover:bg-zinc-300 inline-flex items-center"
+                      title="Copy join link"
+                      onClick={async () => {
+                        try { const url = `${window.location.origin}/?id=${encodeURIComponent(callId)}`; await navigator.clipboard.writeText(url); toast.success('Copied join link') } catch { toast.error('Copy failed') }
+                      }}
+                    >
+                      <span className="inline-flex items-center gap-1.5">
+                        <LinkIcon size={14} className="inline-block"/>
+                        Link
+                      </span>
+                    </button>
+                  </>
+                )}
+                <button
+                  className="text-sm h-10 px-3 rounded border bg-rose-200 text-rose-950 cursor-pointer border-rose-300 hover:bg-rose-300 inline-flex items-center"
+                  onClick={disconnect}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <Power size={16} className="inline-block"/>
+                    Disconnect
+                  </span>
+                </button>
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <div className={`inline-flex items-center gap-2 text-xs px-3 py-1 rounded-full ${status === 'connected' ? 'bg-emerald-300 text-emerald-950' : status === 'connecting' ? 'bg-sky-300 text-sky-950' : status === 'initialized' ? 'bg-amber-300 text-amber-950' : status === 'failed' ? 'bg-rose-300 text-rose-950' : 'bg-zinc-300 text-zinc-900'}`}>
+              <span className={`inline-block w-2 h-2 rounded-full ${status === 'connected' ? 'bg-emerald-700' : status === 'connecting' ? 'bg-sky-700' : status === 'initialized' ? 'bg-amber-700' : status === 'failed' ? 'bg-rose-700' : 'bg-zinc-700'}`}></span>
+              <span className="capitalize">{status}</span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Main */}
+      <div className="max-w-5xl mx-auto px-4 py-5 w-full">
       {/* VIDEO STREAMS */}
       <div className="relative">
+        {mediaError && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center">
+            <div className="px-4 py-3 rounded border bg-amber-200/40 text-amber-950 border-amber-300 text-sm shadow">
+              {mediaError}
+            </div>
+          </div>
+        )}
+        {/* Joining banner for invitees */}
+        {joining && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 rounded-full border bg-sky-200 text-sky-950 border-sky-300 text-xs px-3 py-1 shadow">
+            Joining…
+          </div>
+        )}
         {/* REMOTE */}
         <video
           ref={remoteVideoRef}
           playsInline
           autoPlay
-          className="aspect-video bg-blue-300 rounded-md"
+          className="w-full aspect-video object-cover bg-zinc-200 rounded-md"
         ></video>
-        {/* Connected indicator overlay */}
-        {status === 'connected' && (
-          <div
-            className="absolute top-2 left-2 z-10 inline-flex items-center gap-2 rounded-full bg-green-600/90 text-white text-xs px-2 py-1 shadow"
-            aria-live="polite"
-          >
-            <span className="inline-block w-2 h-2 rounded-full bg-white animate-pulse" />
-            <span>Connected</span>
-          </div>
-        )}
         {/* LOCAL */}
         <video
           ref={localVideoRef}
           playsInline
           autoPlay
-          className="w-1/3 absolute bottom-2 right-2 aspect-video bg-orange-300 rounded-md"
+          className="w-1/3 absolute bottom-2 right-2 aspect-video object-cover bg-zinc-300/80 rounded-md"
         ></video>
       </div>
 
-      {/* CONTROLS */}
-      <div className="mt-4 flex flex-col gap-3">
-        <div className={`inline-flex items-center gap-2 self-start px-3 py-1 rounded text-sm ${statusBadge[status] ?? statusBadge['idle']}`}>
-          <span className="uppercase tracking-wide">Status</span>
-          <span className="font-medium">{status}</span>
-        </div>
-        <button onClick={initializeCamera}>Initialize</button>
-        {!!callId && (
-          <p className="flex items-center gap-2">
-            <strong>Call id :</strong> <span className="font-mono">{callId}</span>
-            <button
-              className="text-sm px-2 py-1 rounded border hover:bg-zinc-100 dark:hover:bg-zinc-900"
-              onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(callId)
-                  toast.success('Copied call id')
-                } catch {
-                  toast.error('Copy failed')
-                }
-              }}
-              title="Copy call id"
-            >
-              Copy
-            </button>
-          </p>
-        )}
-
-        <button
-          className="bg-blue-500 hover:bg-blue-600 active:bg-blue-700 transition-all cursor-pointer text-white px-4 py-2 rounded-md shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-          onClick={startCall}
-          disabled={!isReady}
-          aria-disabled={!isReady}
-          title={!isReady ? 'Initialize camera first' : 'Create a new call'}
-        >
-          Start Call
-        </button>
-        <p>Or</p>
-        <div className="flex gap-4 items-center">
-          <input
-            type="text"
-            className="border rounded px-2 py-1 min-w-64"
-            ref={inputRef}
-            placeholder="Enter the ID of the session"
-            aria-label="Call ID to join"
-          />
-          <button
-            className="bg-teal-500 hover:bg-teal-600 active:bg-teal-700 transition-all cursor-pointer text-white px-4 py-2 rounded-md shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-            onClick={answerCall}
-            disabled={!isReady}
-            aria-disabled={!isReady}
-            title={!isReady ? 'Initialize camera first' : 'Join an existing call'}
-          >
-            Join Call
-          </button>
-        </div>
-        <button
-          onClick={disconnect}
-          className="mt-2 bg-red-500 hover:bg-red-600 active:bg-red-700 transition-all cursor-pointer text-white px-4 py-2 rounded-md shadow-sm"
-        >
-          Disconnect
-        </button>
-        {/* Note: In a production app, consider deleting the call doc and subcollections when both peers leave. */}
       </div>
     </div>
-  );
+  )
 }
