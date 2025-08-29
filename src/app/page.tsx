@@ -27,6 +27,7 @@ function PageInner() {
   const [mediaError, setMediaError] = useState<string | null>(null)
   const [joining, setJoining] = useState<boolean>(false)
   const [inSession, setInSession] = useState<boolean>(false)
+  const [role, setRole] = useState<'caller' | 'answerer' | null>(null)
   const router = useRouter()
   const search = useSearchParams()
 
@@ -141,20 +142,7 @@ function PageInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Redirect to meeting if session exists and URL lacks searchParams
-  useEffect(() => {
-    const id = search.get('id') || ''
-    if (id) return
-    try {
-      const raw = localStorage.getItem('vcw.session')
-      if (!raw) return
-      const s = JSON.parse(raw) as { callId?: string; role?: string }
-      if (s?.callId) {
-        router.replace(`/?id=${encodeURIComponent(s.callId)}${s.role ? `&role=${encodeURIComponent(s.role)}` : ''}`)
-      }
-    } catch {}
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // Note: all persistent session storage removed per request
 
   // Start a new call and publish the offer + ICE candidates
   const startCall = async () => {
@@ -188,12 +176,8 @@ function PageInner() {
       await writeOffer(callDoc, offer)
       toast.success('Call created')
 
-      // Persist session and update URL for share/join links (root path)
-      try {
-        localStorage.setItem('vcw.session', JSON.stringify({ role: 'caller', callId: callDoc.id }))
-      } catch {}
-      const url = `/?id=${encodeURIComponent(callDoc.id)}&role=caller`
-      router.replace(url)
+      // Caller stays on clean URL; only receiver uses id param
+      setRole('caller')
 
       // Listen for an answer and set as remote description
       callDocUnsubRef.current = listenCallDoc(callDoc, (snapshot) => {
@@ -257,10 +241,8 @@ function PageInner() {
       await writeAnswer(callDoc, answer)
       toast.success('Joined call')
 
-      try {
-        localStorage.setItem('vcw.session', JSON.stringify({ role: 'answerer', callId: remoteCallId }))
-      } catch {}
-      const url = `/?id=${encodeURIComponent(remoteCallId)}&role=answerer`
+      setRole('answerer')
+      const url = `/?id=${encodeURIComponent(remoteCallId)}`
       router.replace(url)
 
       // Listen for caller ICE candidates
@@ -283,12 +265,7 @@ function PageInner() {
   // Stop media, close PC, unsubscribe Firestore listeners, and clear UI
   const disconnect = async () => {
     try {
-      // Snapshot session before clearing
-      let sess: { role?: string; callId?: string } | null = null
-      try {
-        const raw = localStorage.getItem('vcw.session')
-        if (raw) sess = JSON.parse(raw)
-      } catch {}
+      // No persisted session: rely on in-memory state only
       // Unsubscribe Firestore listeners if any
       callDocUnsubRef.current?.()
       offerCandUnsubRef.current?.()
@@ -315,8 +292,7 @@ function PageInner() {
       if (localVideoRef.current) localVideoRef.current.srcObject = null
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
       // Best-effort: delete call data if you are the caller (ask first)
-      const idToClear = callId || sess?.callId || ''
-      const role = sess?.role || ''
+      const idToClear = callId
       if (idToClear && role === 'caller') {
         let shouldDelete = false
         try {
@@ -335,10 +311,9 @@ function PageInner() {
         }
       }
 
-      // Clear persisted session (user left)
-      try { localStorage.removeItem('vcw.session') } catch {}
       setStatus('disconnected')
       setInSession(false)
+      setRole(null)
       toast('Disconnected')
       // Clear UI state and URL
       setCallId("")
@@ -350,62 +325,40 @@ function PageInner() {
     }
   }
 
+  // After disconnect, prepare camera again so user can start a new call
+  useEffect(() => {
+    if (!inSession && !localStreamRef.current && !pcRef.current) {
+      // Re-initialize camera to avoid requiring a full page reload
+      // Safe to call multiple times due to checks inside initializeCamera
+      initializeCamera()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inSession])
+
   const isReady = !!localStreamRef.current && !!pcRef.current
 
-  // Auto-join/re-offer when a user opens a join link like /?id=<callId>
-  // If role=caller, re-negotiate a fresh offer into the same callId after reload.
+  // Auto-join as receiver when a user opens a join link like /?id=<callId>
   const autoJoinTriedRef = useRef(false)
   useEffect(() => {
     if (autoJoinTriedRef.current) return
     if (!isReady) return
+    if (inSession) return
 
     const id = search.get('id') || ''
-    const role = (search.get('role') || '').toLowerCase()
     if (!id) return
     autoJoinTriedRef.current = true
-
-    if (role === 'caller') {
-      // Re-offer path for caller
-      ;(async () => {
-        try {
-          const pc = pcRef.current
-          if (!pc) return
-          const { callDoc, offerCandidates, answerCandidates } = getCallRefs(id)
-          setCallId(id)
-          setInSession(true)
-          pc.onicecandidate = (e) => { if (e.candidate) addOfferIceCandidate(offerCandidates, e.candidate.toJSON()) }
-          setStatus('connecting')
-          const offerDescription = await pc.createOffer(); await pc.setLocalDescription(offerDescription)
-          await writeOffer(callDoc, { sdp: offerDescription.sdp, type: offerDescription.type })
-          callDocUnsubRef.current = listenCallDoc(callDoc, (snapshot) => {
-            const data = snapshot.data()
-            if (!pc.currentRemoteDescription && data?.answer) {
-              const anserDescription = new RTCSessionDescription(data.answer)
-              pc.setRemoteDescription(anserDescription)
-            }
-          })
-          answerCandUnsubRef.current = listenAnswerCandidates(answerCandidates, (snapshot) => {
-            snapshot.docChanges().forEach((change) => { if (change.type === 'added') { const c = new RTCIceCandidate(change.doc.data()); pc.addIceCandidate(c) } })
-          })
-          try { localStorage.setItem('vcw.session', JSON.stringify({ role: 'caller', callId: id })) } catch {}
-        } catch (e) {
-          console.error('auto re-offer failed', e)
-        }
-      })()
-    } else {
-      // Prefill and auto-join as answerer
-      if (inputRef.current) inputRef.current.value = id
-      ;(async () => {
-        try {
-          setJoining(true)
-          await answerCall()
-        } finally {
-          setJoining(false)
-        }
-      })()
-    }
+    // Prefill and auto-join as answerer (receiver)
+    if (inputRef.current) inputRef.current.value = id
+    ;(async () => {
+      try {
+        setJoining(true)
+        await answerCall()
+      } finally {
+        setJoining(false)
+      }
+    })()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isReady, search])
+  }, [isReady, search, inSession])
 
   return (
     <div className="min-h-dvh flex flex-col">
@@ -422,7 +375,6 @@ function PageInner() {
                     if (!isReady) await initializeCamera()
                     await startCall()
                   }}
-                  disabled={!isReady}
                 >
                   <span className="inline-flex items-center gap-1.5" title="New meeting">
                     <Plus size={16} className="inline-block"/>
